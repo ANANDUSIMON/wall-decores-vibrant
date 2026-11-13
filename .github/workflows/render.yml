@@ -64,9 +64,9 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------
-  # Join the seven scenes in order. `-c copy` stitches the existing streams
-  # without re-encoding, so the final film is bit-identical to what each
-  # runner produced.
+  # Join the seven scenes in order, crossfading over the 6-frame overlap
+  # each pair shares in src/Film.tsx so the cut matches the combined Film
+  # composition instead of hard-cutting.
   # ---------------------------------------------------------------------
   concat:
     name: Join scenes into final film
@@ -85,20 +85,55 @@ jobs:
           pattern: scene-*
           merge-multiple: true
 
-      - name: Build concat list in S1..S7 order
+      # src/Film.tsx overlaps every consecutive pair of scene Sequences by
+      # exactly 6 frames (0.2s @ 30fps) — e.g. S1 (from:0, dur:150) and S2
+      # (from:144, dur:180) share global frames 144-149 — so each scene
+      # clip above already contains that shared window at its tail/head.
+      # A straight concat would hard-cut through it; xfade blends it instead.
+      # xfade can't use `-c copy`, but this re-encode only happens once, here.
+      - name: Crossfade join (xfade)
         run: |
           mkdir -p out
-          ls -1 scenes
-          for id in S1 S2 S3 S4 S5 S6 S7; do
-            echo "file '$PWD/scenes/${id}.mp4'" >> list.txt
-          done
-          echo "--- concat list ---"
-          cat list.txt
+          set -e
+          FPS=30
+          OVERLAP_FRAMES=6
+          OVERLAP=$(awk "BEGIN{printf \"%.6f\", ${OVERLAP_FRAMES}/${FPS}}")
+          IDS=(S1 S2 S3 S4 S5 S6 S7)
 
-      - name: Join without re-encoding
-        run: |
-          ffmpeg -hide_banner -f concat -safe 0 -i list.txt \
-            -c copy -movflags +faststart \
+          INPUTS=()
+          for id in "${IDS[@]}"; do
+            INPUTS+=(-i "scenes/${id}.mp4")
+          done
+
+          # Read each clip's actual duration back from the file rather than
+          # assuming it, so the offsets stay correct if scene lengths change.
+          DURS=()
+          for id in "${IDS[@]}"; do
+            d=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "scenes/${id}.mp4")
+            DURS+=("$d")
+          done
+
+          FILTER=""
+          CUM="${DURS[0]}"
+          PREV="[0]"
+          for i in 1 2 3 4 5 6; do
+            OFFSET=$(awk "BEGIN{printf \"%.6f\", ${CUM} - ${OVERLAP}}")
+            FILTER+="${PREV}[${i}]xfade=transition=fade:duration=${OVERLAP}:offset=${OFFSET}[v${i}];"
+            CUM=$(awk "BEGIN{printf \"%.6f\", ${CUM} + ${DURS[$i]} - ${OVERLAP}}")
+            PREV="[v${i}]"
+          done
+          FILTER="${FILTER%;}"
+          FINAL_LABEL="${PREV#[}"
+          FINAL_LABEL="${FINAL_LABEL%]}"
+
+          echo "--- durations (s): ${DURS[@]} ---"
+          echo "--- filter_complex ---"
+          echo "$FILTER"
+
+          ffmpeg -hide_banner "${INPUTS[@]}" \
+            -filter_complex "${FILTER}" \
+            -map "[${FINAL_LABEL}]" \
+            -c:v libx264 -crf 18 -pix_fmt yuv420p -movflags +faststart \
             out/wall-decores-vibrant-final.mp4
 
       - name: Report
