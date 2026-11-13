@@ -1,0 +1,116 @@
+name: Render Vibrant Film
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------
+  # One machine per scene, all seven in parallel — wall-clock cost is the
+  # longest single scene, not the sum of all seven.
+  # ---------------------------------------------------------------------
+  render-scene:
+    name: Render ${{ matrix.scene }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scene: [S1, S2, S3, S4, S5, S6, S7]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Cache Remotion browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/remotion
+          key: remotion-browser-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chrome for Remotion
+        run: npx remotion browser ensure
+
+      # --muted matters more than it looks: without it Remotion attaches a
+      # silent AAC track that runs slightly longer than the video, and seven
+      # of those concatenated drift out of sync. Video-only files concat
+      # cleanly.
+      - name: Render ${{ matrix.scene }}
+        run: |
+          mkdir -p out
+          npx remotion render src/index.ts ${{ matrix.scene }} \
+            out/${{ matrix.scene }}.mp4 \
+            --codec h264 \
+            --crf 17 \
+            --x264-preset veryfast \
+            --pixel-format yuv420p \
+            --muted \
+            --log verbose
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scene-${{ matrix.scene }}
+          path: out/${{ matrix.scene }}.mp4
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Join the seven scenes in order. `-c copy` stitches the existing streams
+  # without re-encoding, so the final film is bit-identical to what each
+  # runner produced.
+  # ---------------------------------------------------------------------
+  concat:
+    name: Join scenes into final film
+    needs: render-scene
+    runs-on: ubuntu-latest
+    steps:
+      # The runner image does not always carry ffmpeg, and the concat/ffprobe
+      # steps fail late and confusingly when it is missing.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Download all scenes
+        uses: actions/download-artifact@v4
+        with:
+          path: scenes
+          pattern: scene-*
+          merge-multiple: true
+
+      - name: Build concat list in S1..S7 order
+        run: |
+          mkdir -p out
+          ls -1 scenes
+          for id in S1 S2 S3 S4 S5 S6 S7; do
+            echo "file '$PWD/scenes/${id}.mp4'" >> list.txt
+          done
+          echo "--- concat list ---"
+          cat list.txt
+
+      - name: Join without re-encoding
+        run: |
+          ffmpeg -hide_banner -f concat -safe 0 -i list.txt \
+            -c copy -movflags +faststart \
+            out/wall-decores-vibrant-final.mp4
+
+      - name: Report
+        run: |
+          ffprobe -hide_banner -v error \
+            -show_entries format=duration,size \
+            -show_entries stream=width,height,r_frame_rate,codec_name \
+            -of default=noprint_wrappers=1 \
+            out/wall-decores-vibrant-final.mp4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: out/wall-decores-vibrant-final.mp4
+          retention-days: 30
